@@ -1,125 +1,126 @@
 import pandas as pd
 from datetime import datetime, time
 
-# =======================================================
-# 🔍 FUNCIÓN DE DIAGNÓSTICO (OPCIONAL)
-# =======================================================
-
-def diagnosticar_turnos(file):
-    """
-    Devuelve múltiples lecturas del archivo para inspección en app.py.
-    No afecta el procesamiento real.
-    """
-    resultados = {}
-
-    # Lectura RAW
-    try:
-        df_raw = pd.read_excel(file, header=None)
-        resultados["RAW"] = df_raw
-    except Exception as e:
-        resultados["RAW"] = f"Error RAW: {e}"
-
-    # Lecturas con distintos headers
-    for h in [0, 1, 2, 3, 4]:
-        try:
-            dfh = pd.read_excel(file, header=h)
-            resultados[f"header_{h}"] = dfh
-        except Exception as e:
-            resultados[f"header_{h}"] = f"Error: {e}"
-
-    return resultados
-
-
-# =======================================================
-# 🔧 PARSER DE TURNOS
-# =======================================================
+# ----------------------------------------------------------
+# PARSER
+# ----------------------------------------------------------
 
 def parse_turno(turno_raw):
     if pd.isna(turno_raw):
         return None
     turno_raw = str(turno_raw).strip()
-    if turno_raw == "" or turno_raw.lower() == "libre":
+    if turno_raw.lower() == "libre" or turno_raw == "":
         return None
 
     try:
         partes = turno_raw.split("-")
         ini = partes[0].strip().split(" ")[0]
         fin = partes[1].strip().split(" ")[0]
+
         h_ini = datetime.strptime(ini, "%H:%M:%S").time()
         h_fin = datetime.strptime(fin, "%H:%M:%S").time()
         return (h_ini, h_fin)
     except:
         return None
 
+# ----------------------------------------------------------
+# CARGA REAL DE TURNOS (POR FECHA, NO POR DÍA SEMANA)
+# ----------------------------------------------------------
 
-# =======================================================
-# 🔧 CARGA DE TURNOS (SE AJUSTARÁ UNA VEZ QUE VEAMOS EL DIAG)
-# =======================================================
+def load_turnos(df_raw):
 
-def load_turnos(df):
-    """
-    Esta versión es provisional hasta que veamos cómo Pandas interpreta tu archivo.
-    """
-    raise Exception("⚠️ El processor final se generará después del diagnóstico.")
+    # El encabezado real está en la FILA 2
+    df = pd.read_excel(df_raw, header=2)
+
+    # Detectar columna Nombre
+    col_nombre = [c for c in df.columns if "nombre" in str(c).lower()][0]
+
+    # El resto de columnas son fechas
+    columnas_fechas = [c for c in df.columns if c != col_nombre]
+
+    # Convertir encabezados a fechas reales
+    fechas = pd.to_datetime([df.columns[idx+1] for idx in range(len(columnas_fechas))], errors="coerce")
+
+    # Diccionario final
+    turnos = {}
+
+    for _, row in df.iterrows():
+        nombre = row[col_nombre]
+        turnos[nombre] = {}
+
+        for idx, col in enumerate(columnas_fechas):
+
+            fecha = fechas[idx]
+
+            turno = parse_turno(row[col])
+
+            turnos[nombre][fecha.date()] = turno
+
+    return turnos
 
 
-# =======================================================
-# 🔧 FUNCIÓN AUXILIAR
-# =======================================================
+# ----------------------------------------------------------
+# UTILIDAD
+# ----------------------------------------------------------
 
 def hora_en_intervalo(h, h_ini, h_fin):
     if h_ini <= h_fin:
         return h_ini <= h <= h_fin
     return h >= h_ini or h <= h_fin
 
-
-# =======================================================
-# 🔧 ASIGNACIÓN DE VENTAS (SE MANTIENE IGUAL)
-# =======================================================
+# ----------------------------------------------------------
+# ASIGNACIÓN DE VENTAS
+# ----------------------------------------------------------
 
 def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin, franjas):
 
     df = df_ventas.copy()
     df["createdAt_local"] = pd.to_datetime(df["createdAt_local"])
 
+    # Filtrar por rango
     df = df[(df["createdAt_local"] >= fecha_inicio) & (df["createdAt_local"] <= fecha_fin)]
 
     if df.empty:
         return None, None, None, None
 
-    df["dia_semana"] = df["createdAt_local"].dt.dayofweek
-    df["hora"] = df["createdAt_local"].dt.time
-
     registros = []
 
     for _, row in df.iterrows():
-        dia = row["dia_semana"]
-        hora = row["hora"]
+        fecha = row["createdAt_local"].date()
+        hora = row["createdAt_local"].time()
         monto = row["qt_price_local"]
 
         activos = []
-        for persona, dias in turnos.items():
-            turno = dias.get(dia)
+
+        for persona, turnos_por_fecha in turnos.items():
+
+            if fecha not in turnos_por_fecha:
+                continue
+
+            turno = turnos_por_fecha[fecha]
+
             if turno is None:
                 continue
-            ini, fin = turno
-            if ini and hora_en_intervalo(hora, ini, fin):
+
+            h_ini, h_fin = turno
+
+            if hora_en_intervalo(hora, h_ini, h_fin):
                 activos.append(persona)
 
         if activos:
-            asignado = monto / len(activos)
-            for p in activos:
+            m = monto / len(activos)
+            for a in activos:
                 registros.append({
-                    "fecha": row["createdAt_local"],
+                    "fecha": fecha,
                     "hora": hora,
-                    "coordinador": p,
+                    "coordinador": a,
                     "venta_original": monto,
                     "coordinadores_activos": len(activos),
-                    "venta_asignada": asignado
+                    "venta_asignada": m
                 })
         else:
             registros.append({
-                "fecha": row["createdAt_local"],
+                "fecha": fecha,
                 "hora": hora,
                 "coordinador": None,
                 "venta_original": monto,
@@ -129,25 +130,20 @@ def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin, franjas):
 
     df_asignado = pd.DataFrame(registros)
 
-    df_tot = df_asignado[df_asignado["coordinador"].notna()] \
-        .groupby("coordinador")["venta_asignada"].sum().reset_index()
+    df_totales = df_asignado[df_asignado["coordinador"].notna()].groupby("coordinador")["venta_asignada"].sum().reset_index()
 
-    def obtener_franja(h):
+    # FRANJAS
+    def get_franja(h):
         for ini, fin in franjas:
             if hora_en_intervalo(h, ini, fin):
                 return f"{ini.strftime('%H:%M')} - {fin.strftime('%H:%M')}"
-        return "Fuera de rango"
+        return "Fuera"
 
-    df_asignado["franja"] = df_asignado["hora"].apply(obtener_franja)
+    df_asignado["franja"] = df_asignado["hora"].apply(get_franja)
 
-    df_fran = df_asignado[df_asignado["coordinador"].notna()] \
+    df_franjas = df_asignado[df_asignado["coordinador"].notna()] \
         .groupby(["coordinador", "franja"])["venta_asignada"].sum().reset_index()
 
-    resumen = {
-        "ventas_filtradas": float(df["qt_price_local"].sum()),
-        "total_asignado": float(df_asignado["venta_asignada"].sum()),
-        "no_asignado": float(df["qt_price_local"].sum() - df_asignado["venta_asignada"].sum())
-    }
+    return df_asignado, df_totales, df_franjas, {}
 
-    return df_asignado, df_tot, df_fran, resumen
 
