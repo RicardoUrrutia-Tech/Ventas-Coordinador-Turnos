@@ -1,6 +1,7 @@
 import pandas as pd
 from datetime import datetime, time
 
+
 # ----------------------------------------------------------
 # PARSER DE TURNOS
 # ----------------------------------------------------------
@@ -31,23 +32,19 @@ def parse_turno(turno_raw):
 
 def load_turnos(file):
 
-    # LEER RAW
     df_raw = pd.read_excel(file, header=None)
 
-    # FILA 1 = FECHAS reales de cada columna
+    # Fila 1 = fechas
     fechas = df_raw.iloc[1].tolist()
-
-    # Convertir todas las fechas excepto la primera (que es "Nombre")
     fechas = [fechas[0]] + list(pd.to_datetime(fechas[1:], errors="coerce"))
 
-    # Ahora construir un DataFrame con FILA 2 EN ADELANTE, usando las fechas como encabezado
+    # Crear DF con encabezados = fechas reales
     df = df_raw.iloc[2:].copy()
     df.columns = fechas
 
-    # Detectar columna de nombre (primer columna siempre)
+    # Primera columna es nombre
     col_nombre = df.columns[0]
 
-    # Diccionario final
     turnos = {}
 
     for _, row in df.iterrows():
@@ -77,10 +74,10 @@ def hora_en_intervalo(h, h_ini, h_fin):
 
 
 # ----------------------------------------------------------
-# ASIGNACIÓN DE VENTAS
+# ASIGNACIÓN DE VENTAS POR TURNO
 # ----------------------------------------------------------
 
-def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin, franjas):
+def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin):
 
     df = df_ventas.copy()
     df["createdAt_local"] = pd.to_datetime(df["createdAt_local"])
@@ -88,10 +85,11 @@ def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin, franjas):
     df = df[(df["createdAt_local"] >= fecha_inicio) & (df["createdAt_local"] <= fecha_fin)]
 
     if df.empty:
-        return None, None, None, None
+        return None, None, None
 
     registros = []
 
+    # ------- ASIGNACIÓN DIARIA -------
     for _, row in df.iterrows():
         fecha = row["createdAt_local"].date()
         hora = row["createdAt_local"].time()
@@ -100,9 +98,7 @@ def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin, franjas):
         activos = []
 
         for persona, turnos_por_fecha in turnos.items():
-
             turno = turnos_por_fecha.get(fecha)
-
             if turno is None:
                 continue
 
@@ -111,7 +107,7 @@ def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin, franjas):
             if hora_en_intervalo(hora, h_ini, h_fin):
                 activos.append(persona)
 
-        # ASIGNACIÓN PROPORCIONAL
+        # Asignación proporcional
         if activos:
             m = monto / len(activos)
             for a in activos:
@@ -121,7 +117,8 @@ def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin, franjas):
                     "coordinador": a,
                     "venta_original": monto,
                     "coordinadores_activos": len(activos),
-                    "venta_asignada": m
+                    "venta_asignada": m,
+                    "turno": f"{h_ini.strftime('%H:%M')} - {h_fin.strftime('%H:%M')}"
                 })
         else:
             registros.append({
@@ -130,28 +127,35 @@ def asignar_ventas(df_ventas, turnos, fecha_inicio, fecha_fin, franjas):
                 "coordinador": None,
                 "venta_original": monto,
                 "coordinadores_activos": 0,
-                "venta_asignada": 0
+                "venta_asignada": 0,
+                "turno": "SIN TURNO"
             })
 
     df_asignado = pd.DataFrame(registros)
 
-    # Totales por coordinador
-    df_totales = df_asignado[df_asignado["coordinador"].notna()] \
-        .groupby("coordinador")["venta_asignada"].sum().reset_index()
+    # ----------------------------------------------------------
+    # NUEVO: TOTAL POR COLABORADOR = (Bloques, Total Asignado)
+    # ----------------------------------------------------------
 
-    # Franjas
-    def get_franja(h):
-        for ini, fin in franjas:
-            if hora_en_intervalo(h, ini, fin):
-                return f"{ini.strftime('%H:%M')} - {fin.strftime('%H:%M')}"
-        return "Fuera"
+    # Total asignado
+    df_total_asignado = (
+        df_asignado[df_asignado["coordinador"].notna()]
+        .groupby("coordinador")["venta_asignada"]
+        .sum()
+        .reset_index()
+    )
 
-    df_asignado["franja"] = df_asignado["hora"].apply(get_franja)
+    # Bloques (turnos efectivos)
+    bloques = []
+    for persona, turnos_por_fecha in turnos.items():
+        bloques_trabajados = sum(1 for t in turnos_por_fecha.values() if t is not None)
+        bloques.append({"coordinador": persona, "Bloques": bloques_trabajados})
 
-    df_franjas = df_asignado[df_asignado["coordinador"].notna()] \
-        .groupby(["coordinador", "franja"])["venta_asignada"].sum().reset_index()
+    df_bloques = pd.DataFrame(bloques)
 
-    return df_asignado, df_totales, df_franjas, {}
+    # Fusionar
+    df_totales = df_total_asignado.merge(df_bloques, on="coordinador", how="left")
+    df_totales.columns = ["Nombre", "Total Asignado", "Bloques"]
 
-
+    return df_asignado, df_totales, bloques
 
